@@ -1,0 +1,3 @@
+DROP TABLE IF EXISTS url_schedules;
+DROP TABLE IF EXISTS urls;
+DROP TABLE IF EXISTS regions;

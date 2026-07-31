@@ -1,0 +1,84 @@
+{
+  "descricao": "Vetores de teste de SSRF compartilhados entre monitor-worker e monitor-api. A API valida sintaticamente na criacao da URL; o Worker valida o IP realmente discado no Dialer.Control. As duas implementacoes rodam ESTES casos, senao divergem. Mover para monitor-infra/contracts na fase 0.",
+  "versao": 1,
+  "ip": [
+    { "ip": "127.0.0.1",        "permitido": false, "motivo": "loopback v4" },
+    { "ip": "127.255.255.254",  "permitido": false, "motivo": "loopback v4, fim da faixa" },
+    { "ip": "::1",              "permitido": false, "motivo": "loopback v6" },
+
+    { "ip": "10.0.0.1",         "permitido": false, "motivo": "RFC1918 10/8" },
+    { "ip": "10.255.255.255",   "permitido": false, "motivo": "RFC1918 10/8, fim da faixa" },
+    { "ip": "172.16.0.1",       "permitido": false, "motivo": "RFC1918 172.16/12" },
+    { "ip": "172.31.255.255",   "permitido": false, "motivo": "RFC1918 172.16/12, fim da faixa" },
+    { "ip": "192.168.0.1",      "permitido": false, "motivo": "RFC1918 192.168/16" },
+    { "ip": "192.168.255.255",  "permitido": false, "motivo": "RFC1918 192.168/16, fim da faixa" },
+
+    { "ip": "169.254.0.1",      "permitido": false, "motivo": "link-local v4" },
+    { "ip": "169.254.169.254",  "permitido": false, "motivo": "metadata de nuvem" },
+    { "ip": "fe80::1",          "permitido": false, "motivo": "link-local v6" },
+
+    { "ip": "fd00::1",          "permitido": false, "motivo": "ULA fc00::/7" },
+    { "ip": "fc00::1",          "permitido": false, "motivo": "ULA fc00::/7, inicio" },
+    { "ip": "fd00:ec2::254",    "permitido": false, "motivo": "metadata de nuvem v6" },
+
+    { "ip": "100.64.0.1",       "permitido": false, "motivo": "CGNAT 100.64/10" },
+    { "ip": "100.127.255.255",  "permitido": false, "motivo": "CGNAT 100.64/10, fim da faixa" },
+
+    { "ip": "224.0.0.1",        "permitido": false, "motivo": "multicast v4" },
+    { "ip": "ff02::1",          "permitido": false, "motivo": "multicast v6" },
+
+    { "ip": "0.0.0.0",          "permitido": false, "motivo": "nao especificado v4" },
+    { "ip": "0.1.2.3",          "permitido": false, "motivo": "0.0.0.0/8" },
+    { "ip": "::",               "permitido": false, "motivo": "nao especificado v6" },
+    { "ip": "240.0.0.1",        "permitido": false, "motivo": "reservado 240/4" },
+    { "ip": "255.255.255.255",  "permitido": false, "motivo": "broadcast" },
+
+    { "ip": "::ffff:127.0.0.1",       "permitido": false, "motivo": "IPv4 mapeado: loopback. Comparar 16 bytes contra CIDR v4 nunca casa" },
+    { "ip": "::ffff:169.254.169.254", "permitido": false, "motivo": "IPv4 mapeado: metadata de nuvem. O furo do rascunho" },
+    { "ip": "::ffff:192.168.1.1",     "permitido": false, "motivo": "IPv4 mapeado: RFC1918" },
+    { "ip": "::ffff:10.0.0.1",        "permitido": false, "motivo": "IPv4 mapeado: RFC1918" },
+    { "ip": "::ffff:100.64.0.1",      "permitido": false, "motivo": "IPv4 mapeado: CGNAT" },
+
+    { "ip": "8.8.8.8",          "permitido": true, "motivo": "publico" },
+    { "ip": "1.1.1.1",          "permitido": true, "motivo": "publico" },
+    { "ip": "93.184.216.34",    "permitido": true, "motivo": "publico" },
+    { "ip": "2001:4860:4860::8888", "permitido": true, "motivo": "publico v6" },
+    { "ip": "2606:2800:220:1:248:1893:25c8:1946", "permitido": true, "motivo": "publico v6" },
+
+    { "ip": "9.255.255.255",    "permitido": true, "motivo": "borda: logo abaixo de 10/8" },
+    { "ip": "11.0.0.0",         "permitido": true, "motivo": "borda: logo acima de 10/8" },
+    { "ip": "172.15.255.255",   "permitido": true, "motivo": "borda: logo abaixo de 172.16/12" },
+    { "ip": "172.32.0.0",       "permitido": true, "motivo": "borda: logo acima de 172.16/12" },
+    { "ip": "192.167.255.255",  "permitido": true, "motivo": "borda: logo abaixo de 192.168/16" },
+    { "ip": "192.169.0.0",      "permitido": true, "motivo": "borda: logo acima de 192.168/16" },
+    { "ip": "100.63.255.255",   "permitido": true, "motivo": "borda: logo abaixo do CGNAT" },
+    { "ip": "100.128.0.0",      "permitido": true, "motivo": "borda: logo acima do CGNAT" },
+    { "ip": "169.253.255.255",  "permitido": true, "motivo": "borda: logo abaixo do link-local" },
+    { "ip": "169.255.0.0",      "permitido": true, "motivo": "borda: logo acima do link-local" },
+    { "ip": "223.255.255.255",  "permitido": true, "motivo": "borda: logo abaixo do multicast" },
+    { "ip": "239.255.255.255",  "permitido": false, "motivo": "fim do multicast v4" }
+  ],
+  "sintaticos": [
+    { "url": "ftp://exemplo.com",                 "valido": false, "erro": "esquema" },
+    { "url": "file:///etc/passwd",                "valido": false, "erro": "esquema" },
+    { "url": "javascript:alert(1)",               "valido": false, "erro": "esquema" },
+    { "url": "data:text/html,<script>x</script>", "valido": false, "erro": "esquema" },
+    { "url": "gopher://exemplo.com",              "valido": false, "erro": "esquema" },
+
+    { "url": "http://usuario:senha@exemplo.com",  "valido": false, "erro": "credenciais" },
+    { "url": "https://usuario@exemplo.com",       "valido": false, "erro": "credenciais" },
+    { "url": "https://admin:@exemplo.com/health", "valido": false, "erro": "credenciais" },
+
+    { "url": "http://",                           "valido": false, "erro": "host_vazio" },
+    { "url": "https:///caminho",                  "valido": false, "erro": "host_vazio" },
+
+    { "url": "http://exemplo.com",                "valido": true },
+    { "url": "https://exemplo.com",               "valido": true },
+    { "url": "https://exemplo.com:8443/health",   "valido": true },
+    { "url": "https://sub.dominio.exemplo.com/a/b?c=d", "valido": true },
+    { "url": "https://xn--exemplo-hya.com/",      "valido": true },
+    { "url": "http://exemplo.com:80/",            "valido": true },
+    { "url": "http://192.0.2.10/health",          "valido": true, "nota": "IP publico literal: a validacao sintatica passa; quem bloqueia IP e o dial" },
+    { "url": "http://127.0.0.1/health",           "valido": true, "nota": "sintaticamente valida. O bloqueio de loopback acontece no Dialer.Control, nao aqui, senao haveria duas fontes de verdade" }
+  ]
+}

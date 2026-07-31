@@ -1,0 +1,14 @@
+# segredos e configuração local
+.env
+.env.local
+*.pem
+*.key
+
+# dumps e backups
+*.dump
+*.sql.gz
+/backups/
+
+# SO / editor
+.DS_Store
+*.swp

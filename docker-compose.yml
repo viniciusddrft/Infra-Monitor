@@ -1,0 +1,52 @@
+name: monitor
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: monitor-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-monitor}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-monitor_dev}
+      POSTGRES_DB: ${POSTGRES_DB:-monitor}
+      # o schema assume UTC em toda sessão; a migration 011 fixa por papel,
+      # isto cobre o superusuário e o psql do Makefile
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      # a fila de checks faz ~325 updates/s numa tabela pequena: sem
+      # pg_stat_statements não há como saber qual query degradou
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - max_connections=100
+      - -c
+      - log_min_duration_statement=200
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # sem o healthcheck, `make migrate` corre antes de o banco aceitar conexão
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-monitor} -d ${POSTGRES_DB:-monitor}"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  # Alvos locais para o worker checar. Ver targets/nginx.conf.
+  alvo-local:
+    image: nginx:alpine
+    container_name: monitor-alvo-local
+    ports:
+      - "${TARGET_PORT:-8081}:80"
+    volumes:
+      - ./targets/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/ok || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:
+    name: monitor-pgdata
