@@ -6,6 +6,16 @@
 
 SET timezone = 'UTC';
 
+-- A porta do nginx vem do .env (TARGET_PORT), que o `make seed` repassa por -v.
+-- Antes ela era literal 8081 aqui enquanto o compose honrava ${TARGET_PORT}:
+-- mudar a porta no .env deixava os monitores semeados apontando para porta
+-- morta, e o sintoma era "o worker não checa nada", que não parece um problema
+-- de seed. Default para quem executar este arquivo na mão.
+\if :{?target_port}
+\else
+\set target_port 8081
+\endif
+
 BEGIN;
 
 -- ── usuário e time ──────────────────────────────────────────────────────────
@@ -41,8 +51,11 @@ END $$;
 -- draft: como não resolvem, são alvo de FALHA GARANTIDA por DNS — o que os
 -- torna úteis para o caminho de queda, que é o mais difícil de reproduzir.
 --
--- O host `localhost:8081` é o nginx do compose. O worker rodando na máquina
--- alcança ali; rodando dentro do compose, seria http://alvo-local/.
+-- O host `localhost:{TARGET_PORT}` é o nginx do compose. O worker rodando na
+-- máquina alcança ali; rodando dentro do compose, seria http://alvo-local/.
+-- A idempotência abaixo é por URL exata: trocar TARGET_PORT e semear de novo
+-- acrescenta um segundo conjunto de monitores em vez de atualizar o primeiro.
+-- Para dev está bom; se incomodar, `make reset`.
 -- Lembre que o guard de SSRF bloqueia loopback por padrão: em dev é preciso
 -- SSRF_ALLOWED_CIDRS=127.0.0.0/8 (ver .env.example).
 WITH time_dev AS (
@@ -58,19 +71,19 @@ novas AS (
            v.esperados, v.segue_redirect, v.pausada
       FROM time_dev d, (VALUES
         -- caminho feliz: sobe e continua no ar
-        ('Alvo local OK',          'http://localhost:8081/ok',                  60, 10, '{200}'::INT[],           true,  false),
+        ('Alvo local OK',          'http://localhost:' || :'target_port' || '/ok',                  60, 10, '{200}'::INT[],           true,  false),
         -- cai por status: 500 persistente. É o bug B2 do rascunho, que
         -- derrubava o worker inteiro por dereferência de resposta nula
-        ('Alvo local 500',         'http://localhost:8081/erro',                60, 10, '{200}'::INT[],           true,  false),
+        ('Alvo local 500',         'http://localhost:' || :'target_port' || '/erro',                60, 10, '{200}'::INT[],           true,  false),
         -- cai por status fora do conjunto esperado
-        ('Alvo local 404',         'http://localhost:8081/nao-encontrado',      60, 10, '{200}'::INT[],           true,  false),
+        ('Alvo local 404',         'http://localhost:' || :'target_port' || '/nao-encontrado',      60, 10, '{200}'::INT[],           true,  false),
         -- redirect que termina bem: up com 1 salto
-        ('Alvo local redirect',    'http://localhost:8081/redireciona',        120, 10, '{200}'::INT[],           true,  false),
+        ('Alvo local redirect',    'http://localhost:' || :'target_port' || '/redireciona',        120, 10, '{200}'::INT[],           true,  false),
         -- redirect de alvo público para metadata de nuvem:
         -- unknown / ssrf_blocked, bloqueado no salto pelo Dialer.Control
-        ('Alvo redirect privado',  'http://localhost:8081/redireciona-privado', 300, 10, '{200}'::INT[],          true,  false),
+        ('Alvo redirect privado',  'http://localhost:' || :'target_port' || '/redireciona-privado', 300, 10, '{200}'::INT[],          true,  false),
         -- cadeia de 6 saltos, acima do máximo de 5: too_many_redirects
-        ('Alvo cadeia longa',      'http://localhost:8081/cadeia',              300, 10, '{200}'::INT[],          true,  false),
+        ('Alvo cadeia longa',      'http://localhost:' || :'target_port' || '/cadeia',              300, 10, '{200}'::INT[],          true,  false),
         -- FALHA GARANTIDA por DNS (domínios do draft, não resolvem)
         ('API Principal',          'https://api.exemplo.com/health',            300, 10, '{200}'::INT[],          true,  false),
         ('Serviço de Login',       'https://auth.exemplo.com/health',           300, 10, '{200,204}'::INT[],      true,  false),

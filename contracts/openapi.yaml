@@ -1,0 +1,1320 @@
+openapi: 3.0.3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Este arquivo é CANÔNICO e vem ANTES do código (decisão A31).
+#
+#   - o CI da monitor-api valida toda resposta dos testes contra ele
+#     (`api/tests/internal/harness/http.go` → openapi3filter.ValidateResponse);
+#   - o CI do monitor-app gera os modelos Dart a partir dele;
+#   - mudança de contrato é PR AQUI, revisado antes de existir implementação.
+#
+# Escopo desta versão: fase 1 (ciclo de check) mais as rotas de fase 2 que a
+# suíte black-box da API já exercita — devices, notifications e prefs. Rota que
+# a suíte chama e não está aqui vira erro "rota ausente no OpenAPI", não um
+# teste que passa por engano.
+#
+# NÃO coberto ainda, e cada um entra por PR na sua fase:
+#   - times e convites (/v1/team/**)                              → fase 5
+#   - billing (/v1/subscription, /v1/billing/**)                  → fase 6
+#   - exclusão de conta (DELETE /v1/me)                           → fase 6
+#   - marcar notificação como lida (/v1/notifications/:id/read)   → fase 2
+#
+# Três convenções que valem para o documento inteiro:
+#
+#   1. Toda operação declara `default` com o envelope de erro do PLANO.md §9.
+#      Sem isso o kin-openapi ACEITA em silêncio qualquer status não
+#      documentado — um 500 com corpo em texto passaria como resposta válida.
+#   2. Header declarado como `required: true` é verificado de verdade
+#      (ETag no dashboard, Retry-After no 429). Header opcional é documentação.
+#   3. Os schemas são ABERTOS (sem `additionalProperties: false`) de propósito:
+#      campo a mais não quebra o build, campo faltando ou com tipo errado sim.
+#      Fechar os objetos aqui transformaria cada campo novo da API em quebra de
+#      CI antes de o app sequer consumi-lo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+info:
+  title: monitor-api
+  version: 1.0.0-fase1
+  description: |
+    API do monitor de uptime. Atende exclusivamente o app: autentica com Google,
+    administra a configuração dos monitores e serve estado, histórico e incidentes.
+
+    A API **não** executa check, não decide status e não envia push — quem faz é o
+    `monitor-worker`, e o contrato entre os dois é o banco, nunca uma chamada HTTP.
+
+    Autorização vem sempre do banco (`users.team_id` e `users.role`), nunca do claim
+    do token. Recurso de outro time responde `404`, nunca `403` — `403` confirmaria
+    a existência do recurso.
+
+# SEM bloco `servers`, de propósito. O host varia por ambiente e o harness sobe a API
+# em porta aleatória, então não há URL fixa a declarar. E `servers: [{url: /}]`, que
+# parece o equivalente inofensivo, QUEBRA o roteamento: o router do kin-openapi consome
+# o prefixo do servidor antes de casar o caminho e nenhuma rota resolve — a suíte inteira
+# falharia com "rota ausente no OpenAPI". Sem o bloco, os caminhos abaixo casam direto.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: infra
+    description: Sonda de processo. Sem autenticação, sem estado.
+  - name: auth
+    description: Login com Google, rotação de refresh e logout.
+  - name: urls
+    description: Configuração dos monitores. Zona de escrita exclusiva da API.
+  - name: leitura
+    description: Estado observado, histórico e incidentes. Só leitura.
+  - name: notificações
+    description: Devices, inbox e preferências por usuário.
+
+paths:
+  # ── infra ──────────────────────────────────────────────────────────────────
+  /healthz:
+    get:
+      tags: [infra]
+      operationId: health
+      summary: O processo está vivo
+      description: Não toca o banco. Liveness que depende de dependência derruba o processo por soluço alheio.
+      security: []
+      responses:
+        '200':
+          description: Processo no ar
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /readyz:
+    get:
+      tags: [infra]
+      operationId: ready
+      summary: Apta a receber tráfego
+      description: |
+        Verifica **só o banco**. Dependência opcional em readiness tira todas as
+        instâncias do balanceador de uma vez — é por isso que o JWKS do Google
+        não entra aqui, nem no boot.
+      security: []
+      responses:
+        '200':
+          description: Banco alcançável
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Banco inacessível
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/app-config:
+    get:
+      tags: [infra]
+      operationId: getAppConfig
+      summary: Configuração pública do app
+      description: |
+        `min_supported_version` vem de `system_flags.min_app_version`, lido do **mesmo**
+        cache de 10s que o middleware de versão usa. Fonte única e obrigatória: com duas,
+        o catálogo diz 12 enquanto o middleware aceita 11, e o app bloqueia quem consegue
+        usar o produto (ou o contrário).
+
+        Bloquear uma versão ruim é um `UPDATE`, não um deploy.
+      security: []
+      responses:
+        '200':
+          description: Catálogo público
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppConfig' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── auth ───────────────────────────────────────────────────────────────────
+  /v1/auth/google:
+    post:
+      tags: [auth]
+      operationId: authGoogle
+      summary: Login ou cadastro com ID token do Google
+      description: |
+        Valida o ID token contra o JWKS do Google (`iss`, `aud`, `exp`, assinatura,
+        `email_verified` e `nonce`) e faz UPSERT por `google_sub` — o e-mail muda,
+        o `sub` não.
+
+        No primeiro login cria, na **mesma transação**, usuário + time + assinatura
+        free + preferências de notificação. As FKs circulares entre `users` e `teams`
+        exigem reservar os dois IDs com `nextval` antes dos `INSERT`s.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GoogleLoginRequest' }
+      responses:
+        '200':
+          description: Par de tokens emitido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401':
+          description: ID token inválido, expirado, de outro `aud`, com e-mail não verificado ou `nonce` divergente
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503':
+          description: JWKS do Google inacessível. A API sobe e opera assim mesmo; só esta rota cai.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: authRefresh
+      summary: Rotaciona o refresh token
+      description: |
+        Rotação com `family_id` e janela de tolerância de ~10s: dois refresh em paralelo
+        do app (single-flight furado, rede lenta) não podem derrubar a sessão. Reuso
+        **depois** da graça é ataque presumido e revoga a família inteira.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: Novo par emitido; o token apresentado é invalidado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenPair' }
+        '401':
+          description: Token desconhecido, expirado, revogado ou reusado fora da graça
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/auth/logout:
+    post:
+      tags: [auth]
+      operationId: authLogout
+      summary: Revoga a família de refresh da sessão
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '204':
+          description: Sessão encerrada. Idempotente — token já revogado também devolve 204.
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── sessão ─────────────────────────────────────────────────────────────────
+  /v1/me:
+    get:
+      tags: [leitura]
+      operationId: getMe
+      summary: Usuário, time, plano e uso
+      description: |
+        `team_id` e `role` são lidos do banco a cada request. É isto que faz membro
+        removido perder acesso na request **seguinte**, com o access token ainda dentro
+        da validade de 15 minutos — e não 15 minutos depois.
+      responses:
+        '200':
+          description: Sessão corrente
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── dashboard ──────────────────────────────────────────────────────────────
+  /v1/dashboard:
+    get:
+      tags: [leitura]
+      operationId: getDashboard
+      summary: Lista de monitores com estado atual
+      description: |
+        É o endpoint do polling (30s, só em primeiro plano). Lê `urls.current_status`,
+        que é coluna — **nunca** agrega `url_history` cru aqui.
+
+        `ETag = W/"t{team_id}-v{teams.dashboard_version}"`, puramente por versão, sem
+        bucket de minuto. O preço dessa escolha é que `dashboard_version` precisa ser
+        incrementada em **toda** mudança visível (helper `touch_team`): sem o minuto
+        para mascarar, um incremento esquecido vira dado velho permanente.
+
+        `uptime_24h` cobre as 24 horas **fechadas** mais recentes, vindo do rollup. O
+        número com a hora corrente está na tela de detalhe, e a diferença entre as duas
+        telas está no contrato para não virar surpresa.
+      parameters:
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Snapshot do time
+          headers:
+            ETag:
+              required: true
+              description: 'Formato `W/"t{team_id}-v{dashboard_version}"`'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Dashboard' }
+        '304':
+          description: |
+            Nada mudou desde o `If-None-Match`. **Sem corpo** — o custo é um SELECT
+            indexado de uma linha, e é o que sustenta o polling.
+          headers:
+            ETag:
+              required: true
+              schema: { type: string }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── urls ───────────────────────────────────────────────────────────────────
+  /v1/urls:
+    get:
+      tags: [urls]
+      operationId: listUrls
+      summary: Lista paginada de monitores
+      description: Cursor opaco, nunca `OFFSET`. Cursor corrompido é `400 validation_error`, não 500.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de monitores
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UrlPage' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+    post:
+      tags: [urls]
+      operationId: createUrl
+      summary: Cria um monitor
+      description: |
+        Tudo numa transação: idempotência → `SELECT ... FROM teams WHERE id = $1 FOR UPDATE`
+        → cota → intervalo mínimo do plano → SSRF sintático → `INSERT urls` → uma linha de
+        `url_schedules` **por região** → `touch_team` → `audit_log`.
+
+        O `FOR UPDATE` vem **antes** do `count(*)` porque agregado não aceita `FOR UPDATE`.
+        É o que faz duas criações simultâneas no limite resultarem em uma criada e uma
+        `403 plan_limit_reached`, em vez de furar a cota.
+
+        A URL nasce `unknown/never_checked` — nunca `up`, nunca `down`. O primeiro check
+        entra na mesma transação, e é por isso que a fila mora no Postgres.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKeyRequired'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UrlCreate' }
+      responses:
+        '201':
+          description: Monitor criado e agendado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Url' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Cota do plano atingida (`plan_limit_reached`)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `ssrf_blocked` (esquema fora de http/https, credenciais na URL, host privado
+            ou literal, tamanho acima de 2048), `interval_below_plan_minimum`, ou
+            `idempotency_key_reuse` — mesma chave com corpo ou endpoint diferente.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/urls/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UrlId'
+    get:
+      tags: [urls]
+      operationId: getUrl
+      summary: Um monitor
+      responses:
+        '200':
+          description: Monitor
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Url' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+    patch:
+      tags: [urls]
+      operationId: patchUrl
+      summary: Altera a configuração de um monitor
+      description: |
+        Ordem de lock obrigatória: `url_schedules` → `urls` → `incidents`, a mesma do
+        Worker. Escrever `urls` primeiro deadlocka contra o writer.
+
+        Toda alteração incrementa `config_version` — é o que invalida um check já em voo
+        e chama `touch_team`. Mudar `check_interval_seconds` revalida o mínimo do plano e
+        **reagenda** (`next_check_at = now()`), senão o usuário troca 300s por 60s e não
+        vê efeito por cinco minutos.
+
+        Dois cuidados que o contrato fixa:
+
+        - reagendar **respeita pausa e suspensão**: `next_check_at` só volta para `now()`
+          se a URL não estiver pausada nem suspensa. Incondicional, renomear uma URL
+          pausada a ressuscitaria;
+        - só a alteração do campo `url` limpa `suspended_reason = 'config_error'`.
+          Renomear não muda o fato de o alvo resolver para `169.254.169.254`, e nenhum
+          `PATCH` limpa `'entitlement'` — o trigger do banco recusa.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UrlPatch' }
+      responses:
+        '200':
+          description: Monitor atualizado, com `config_version` já incrementada
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Url' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422':
+          description: '`ssrf_blocked` ou `interval_below_plan_minimum`'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+    delete:
+      tags: [urls]
+      operationId: deleteUrl
+      summary: Apaga um monitor (só dono)
+      description: |
+        *Soft delete* na `urls` — o histórico e os incidentes referenciam a linha, e o PDF
+        de um período passado precisa do nome. Mas as linhas de `url_schedules` são
+        **apagadas de verdade**: o dispatcher não filtra `deleted_at`, de propósito, para
+        o índice do claim ser varredura de faixa pura. Só marcar `deleted_at` deixaria a
+        URL sendo checada para sempre.
+
+        Libera cota na hora, porque a cota conta `WHERE deleted_at IS NULL`.
+      responses:
+        '204':
+          description: Apagado
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: Membro não apaga URL (`forbidden`). Só o dono.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/urls/{id}/pause:
+    parameters:
+      - $ref: '#/components/parameters/UrlId'
+    post:
+      tags: [urls]
+      operationId: pauseUrl
+      summary: Pausa um monitor
+      description: |
+        Grava `paused = true` e `next_check_at = 'infinity'`, incrementa `config_version`
+        e chama `touch_team`. Idempotente.
+      responses:
+        '200':
+          description: Monitor pausado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Url' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/urls/{id}/resume:
+    parameters:
+      - $ref: '#/components/parameters/UrlId'
+    post:
+      tags: [urls]
+      operationId: resumeUrl
+      summary: Retoma um monitor
+      description: |
+        Grava `paused = false` e `next_check_at = now()` **se não houver
+        `suspended_reason`** — retomar não limpa suspensão. Reassinar limpa
+        `entitlement`, editar a URL limpa `config_error`, e o que o sistema suspendeu
+        continua suspenso. A URL volta a ser checada em ≤ 5s.
+      responses:
+        '200':
+          description: Monitor retomado. Se havia `suspended_reason`, ele permanece e a agenda continua em `infinity`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Url' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── histórico e incidentes ─────────────────────────────────────────────────
+  /v1/urls/{id}/history:
+    parameters:
+      - $ref: '#/components/parameters/UrlId'
+    get:
+      tags: [leitura]
+      operationId: getUrlHistory
+      summary: Série do gráfico
+      description: |
+        | `range` | Fonte | Bucket | Pontos |
+        |---|---|---|---|
+        | `24h` | `url_history` cru | 5 min | 288 |
+        | `7d`  | `url_history_hourly` | 1 h | 168 |
+        | `30d` | `url_history_daily` | 1 dia | 30 |
+        | `90d` | `url_history_daily` | 1 dia | 90 (só plano pago) |
+
+        Esta é a rota de **detalhe**, não a de polling: ela pode agregar dado cru porque
+        roda quando o usuário abre uma URL, limitada a ≤ 1.440 linhas por request. Quem
+        nunca agrega cru é o `/v1/dashboard`, que roda 167 vezes por segundo.
+
+        Só linhas com `applied = true` entram — resultado de check cujo lease venceu é
+        registro de auditoria, não evidência.
+
+        Os horizontes maiores unem o rollup fechado com o bucket parcial atual, senão o
+        gráfico teria um buraco justamente no ponto que mais interessa.
+
+        Os dois números de disponibilidade nunca se misturam: `uptime_consolidado` vem da
+        duração dos incidentes e é o número grande da tela; `disponibilidade_por_amostra`
+        vem do rollup e é diagnóstico. `cobertura` expõe quanto da janela foi de fato
+        medido — `unknown` fica fora do denominador do uptime, que é a resposta honesta,
+        mas esconderia um período cego dentro de um número bonito.
+      parameters:
+        - name: range
+          in: query
+          required: false
+          description: Limitado pela retenção do plano.
+          schema:
+            type: string
+            enum: ['24h', '7d', '30d', '90d']
+            default: '24h'
+      responses:
+        '200':
+          description: Série agregada
+          headers:
+            Cache-Control:
+              description: '`private, max-age=60`'
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/History' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`range_exceeds_plan_retention` — horizonte acima da retenção do plano'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/urls/{id}/incidents:
+    parameters:
+      - $ref: '#/components/parameters/UrlId'
+    get:
+      tags: [leitura]
+      operationId: listUrlIncidents
+      summary: Incidentes de um monitor num período
+      description: |
+        `from` e `to` são obrigatórios porque o PDF precisa de **todos** os incidentes de
+        um período: sem filtro, o app teria que paginar a vida inteira da URL para montar
+        um relatório de 90 dias. `total` existe para o app saber quantas páginas buscar e
+        para o PDF poder dizer "23 incidentes".
+
+        Cursor é `(started_at, id)`, decrescente, com `id` como desempate — dois
+        incidentes no mesmo `started_at` não podem embaralhar a paginação. Incidentes são
+        append-only, então um incidente novo aparece antes do cursor e não desloca as
+        páginas já buscadas.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de incidentes, mais recentes primeiro
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/IncidentPage' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  # ── notificações ───────────────────────────────────────────────────────────
+  /v1/devices:
+    post:
+      tags: [notificações]
+      operationId: registerDevice
+      summary: Registra o token FCM do aparelho
+      description: |
+        UPSERT por `fcm_token`, **sempre 200, nunca 409**: reinstalar o app ou trocar de
+        conta no mesmo aparelho reaproveita o token, e o registro precisa transferir o
+        device para o novo usuário em vez de falhar. Devolve `device_id` porque o token
+        nunca vai na URL do `DELETE` — lá ele acabaria em log de acesso, métrica e trace.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DeviceRegistration' }
+      responses:
+        '200':
+          description: Device registrado ou transferido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DeviceRegistered' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/devices/{device_id}:
+    parameters:
+      - name: device_id
+        in: path
+        required: true
+        schema: { type: integer, format: int64 }
+    delete:
+      tags: [notificações]
+      operationId: deleteDevice
+      summary: Remove o registro do aparelho
+      responses:
+        '204':
+          description: Removido
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/notifications:
+    get:
+      tags: [notificações]
+      operationId: listNotifications
+      summary: Inbox do usuário
+      description: |
+        Uma linha **por usuário**, não por time: `read_at`, preferência e exclusão de
+        conta são individuais, e um membro marcar como lida não pode apagar o aviso dos
+        outros.
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Página de notificações
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPage' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+  /v1/notification-prefs:
+    get:
+      tags: [notificações]
+      operationId: getNotificationPrefs
+      summary: Preferências de notificação do usuário
+      responses:
+        '200':
+          description: Preferências
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPrefs' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+    patch:
+      tags: [notificações]
+      operationId: patchNotificationPrefs
+      summary: Altera as preferências do usuário
+      description: |
+        `quiet_from` e `quiet_to` andam juntos — o banco recusa um sem o outro. `timezone`
+        é IANA e não é enfeite: quiet hours em UTC silencia o horário errado para todo
+        mundo fora de Greenwich.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/NotificationPrefsPatch' }
+      responses:
+        '200':
+          description: Preferências após a alteração
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/NotificationPrefs' }
+        '400': { $ref: '#/components/responses/ValidationError' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '426': { $ref: '#/components/responses/UpgradeRequired' }
+        default: { $ref: '#/components/responses/DefaultError' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token de 15 minutos. `team_id` e `role` do claim são informativos — a autorização é lida do banco.
+
+  parameters:
+    UrlId:
+      name: id
+      in: path
+      required: true
+      schema: { type: integer, format: int64 }
+
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Cursor opaco devolvido em `next_cursor`. Valor corrompido é `400 validation_error`.
+      schema: { type: string }
+
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      schema: { type: string }
+
+    IdempotencyKeyRequired:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        Escopo é (time, endpoint, chave). Mesma chave com o mesmo corpo replica a resposta
+        original; com corpo ou endpoint diferente é `422 idempotency_key_reuse`, nunca uma
+        segunda operação.
+      schema: { type: string, minLength: 8, maxLength: 128 }
+
+  responses:
+    DefaultError:
+      description: Erro não previsto explicitamente nesta operação. Sempre no envelope do §9.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    Unauthorized:
+      description: |
+        `unauthenticated` (token ausente, inválido ou expirado) ou `session_replaced`
+        (`team_id` do token ≠ `users.team_id`, ou refresh revogado por mudança de
+        membership). O app trata os dois de formas diferentes: o segundo limpa os caches
+        e refaz o bootstrap sem deslogar.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    NotFound:
+      description: |
+        `not_found`. Vale para recurso inexistente **e** para recurso de outro time —
+        `403` ali confirmaria a existência.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    ValidationError:
+      description: '`validation_error`, com `details.fields` por campo.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    UpgradeRequired:
+      description: |
+        `app_version_unsupported`. O `X-App-Version` está abaixo de
+        `system_flags.min_app_version`. Vale em toda rota autenticada.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+    TooManyRequests:
+      description: '`rate_limited`. Contado no Postgres, não em memória — com duas réplicas, contador em memória dobra o limite real.'
+      headers:
+        Retry-After:
+          required: true
+          description: Segundos até a próxima tentativa.
+          schema: { type: integer, minimum: 1 }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+  schemas:
+    # ── erro ────────────────────────────────────────────────────────────────
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              description: |
+                O que o app usa para decidir comportamento. **Nunca parsear `message`** —
+                ela é texto para humano, em pt-BR, e muda sem aviso.
+              type: string
+              enum:
+                - validation_error
+                - unauthenticated
+                - session_replaced
+                - invalid_google_token
+                - forbidden
+                - plan_limit_reached
+                - range_exceeds_plan_retention
+                - not_found
+                - conflict
+                - team_not_empty
+                - invite_email_mismatch
+                - ssrf_blocked
+                - interval_below_plan_minimum
+                - idempotency_key_reuse
+                - app_version_unsupported
+                - rate_limited
+                - internal_error
+                - dependency_unavailable
+            message:
+              type: string
+              description: Texto para humano, em pt-BR.
+            details:
+              type: object
+              nullable: true
+              description: 'Contexto por código. `validation_error` traz `fields`; `plan_limit_reached` traz `limit` e `used`.'
+            request_id:
+              type: string
+              description: Presente em `internal_error`, para o usuário reportar sem que o corpo vaze detalhe interno.
+      example:
+        error:
+          code: plan_limit_reached
+          message: Seu plano permite até 5 monitores.
+          details: { limit: 5, used: 5 }
+
+    # ── infra ───────────────────────────────────────────────────────────────
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+
+    AppConfig:
+      type: object
+      required: [min_supported_version, plans, privacy_policy_url, terms_url, account_deletion_url]
+      properties:
+        min_supported_version:
+          type: integer
+          description: |
+            `versionCode` mínimo aceito. Abaixo disso toda rota autenticada devolve 426 e o
+            app mostra tela de bloqueio. É a única forma de matar uma versão com bug —
+            deploy de servidor se reverte em minutos, versão na Play fica no celular para sempre.
+        plans:
+          type: array
+          items: { $ref: '#/components/schemas/PlanConfig' }
+        privacy_policy_url: { type: string, format: uri }
+        terms_url: { type: string, format: uri }
+        account_deletion_url:
+          type: string
+          format: uri
+          description: Exigência do Google para app com login. Bloqueia a publicação se faltar.
+
+    PlanLimits:
+      type: object
+      required: [code, name, max_urls, max_members, min_interval_seconds, retention_days]
+      properties:
+        code: { type: string, enum: [free, pro] }
+        name: { type: string }
+        max_urls: { type: integer }
+        max_members: { type: integer }
+        min_interval_seconds: { type: integer }
+        retention_days: { type: integer }
+
+    PlanConfig:
+      allOf:
+        - $ref: '#/components/schemas/PlanLimits'
+        - type: object
+          required: [products]
+          properties:
+            products:
+              type: array
+              description: |
+                Lista, não campo único: mensal **e** anual existem desde o primeiro dia
+                (`plan_products`), e com um `product_id` só o app não teria como oferecer o
+                anual. Vazia no plano grátis.
+              items: { $ref: '#/components/schemas/PlanProduct' }
+
+    PlanProduct:
+      type: object
+      required: [period, product_id]
+      properties:
+        period: { type: string, enum: [monthly, annual] }
+        product_id:
+          type: string
+          description: ID do produto na Play (`plan_products.play_product_id`).
+
+    # ── auth ────────────────────────────────────────────────────────────────
+    GoogleLoginRequest:
+      type: object
+      required: [id_token, nonce]
+      properties:
+        id_token: { type: string }
+        nonce:
+          type: string
+          description: Gerado pelo app e conferido contra o claim do ID token. Divergência é 401.
+
+    RefreshRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string }
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, token_type, expires_in]
+      properties:
+        access_token: { type: string }
+        refresh_token:
+          type: string
+          description: Rotacionado a cada uso. O valor cru nunca é persistido — o banco guarda SHA-256.
+        token_type: { type: string, enum: [Bearer] }
+        expires_in:
+          type: integer
+          description: Vida do access token, em segundos (900).
+
+    # ── sessão ──────────────────────────────────────────────────────────────
+    Me:
+      type: object
+      required: [user, team, plan, usage]
+      properties:
+        user: { $ref: '#/components/schemas/MeUser' }
+        team: { $ref: '#/components/schemas/MeTeam' }
+        plan: { $ref: '#/components/schemas/PlanLimits' }
+        usage:
+          type: object
+          required: [urls_used, urls_limit]
+          properties:
+            urls_used: { type: integer }
+            urls_limit: { type: integer }
+
+    MeUser:
+      type: object
+      required: [id, email, name, avatar_url, role]
+      properties:
+        id: { type: integer, format: int64 }
+        email: { type: string, format: email }
+        name: { type: string }
+        avatar_url: { type: string, nullable: true }
+        role:
+          type: string
+          enum: [owner, member]
+          description: Lido do banco a cada request, nunca do claim.
+
+    MeTeam:
+      type: object
+      required: [id, name, plan]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        plan:
+          type: string
+          enum: [free, pro]
+          description: Vem de `subscriptions.plan`. Não existe `teams.plan`.
+
+    # ── dashboard ───────────────────────────────────────────────────────────
+    Dashboard:
+      type: object
+      required: [team, urls, brake_engaged]
+      properties:
+        team:
+          type: object
+          required: [plan, urls_used, urls_limit]
+          properties:
+            plan: { type: string, enum: [free, pro] }
+            urls_used: { type: integer }
+            urls_limit: { type: integer }
+        urls:
+          type: array
+          items: { $ref: '#/components/schemas/DashboardUrl' }
+        brake_engaged:
+          type: boolean
+          description: |
+            Alguma instância do Worker está cega **agora** (`worker_blindness` com
+            `updated_at` recente). Instância cega que morreu deixa de contar em ~60s.
+            Permite o app dizer "estamos com dificuldade de medir" em vez de mostrar dado
+            silenciosamente cego.
+
+    DashboardUrl:
+      type: object
+      required:
+        [id, name, status, unknown_reason, since, last_checked_at, uptime_24h,
+         paused, suspended_reason, open_incident_id]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string }
+        status: { $ref: '#/components/schemas/MonitorStatus' }
+        unknown_reason: { $ref: '#/components/schemas/UnknownReason' }
+        since:
+          type: string
+          format: date-time
+          nullable: true
+          description: Desde quando está no estado atual (`urls.current_status_since`).
+        last_checked_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Sustenta o rótulo "atualizado há X" do app. Muda de valor só quando algo mais
+            mudou — o rótulo é sobre a idade do **snapshot**, não sobre o último check.
+        uptime_24h:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Percentual das 24 horas **fechadas** mais recentes, do rollup. `null` enquanto
+            não houver rollup materializado. Nunca agrega `url_history` cru — este é o
+            caminho de polling.
+        paused: { type: boolean }
+        suspended_reason: { $ref: '#/components/schemas/SuspendedReason' }
+        open_incident_id:
+          type: integer
+          format: int64
+          nullable: true
+
+    # ── url ─────────────────────────────────────────────────────────────────
+    MonitorStatus:
+      type: string
+      enum: [up, down, unknown]
+      description: |
+        `unknown` não é falha de leitura: é a resposta honesta quando não há evidência
+        fresca. Nunca inventar `up` nem `down` — e todo `unknown` carrega motivo.
+
+    UnknownReason:
+      type: string
+      nullable: true
+      enum: [never_checked, stale_evidence, blind, ssrf_blocked, config_error, host_saturated, null]
+      description: |
+        Não-nulo **se e somente se** `status = 'unknown'` — o `CHECK` da tabela `urls`
+        exige a equivalência nos dois sentidos.
+
+    SuspendedReason:
+      type: string
+      nullable: true
+      enum: [entitlement, config_error, null]
+      description: |
+        Suspensão pelo **sistema**, distinta de `paused`, que é intenção do usuário.
+        `entitlement` sai ao reassinar; `config_error` sai ao editar o campo `url`.
+        Nenhum dos dois sai com `resume`.
+
+    Url:
+      type: object
+      required:
+        [id, name, url, check_interval_seconds, timeout_seconds, expected_status_codes,
+         follow_redirects, regions, paused, config_version, status, unknown_reason,
+         status_since, last_checked_at, suspended_reason, created_at, updated_at]
+      properties:
+        id: { type: integer, format: int64 }
+        name: { type: string, minLength: 1, maxLength: 120 }
+        url: { type: string, minLength: 8, maxLength: 2048 }
+        check_interval_seconds: { type: integer, minimum: 30, maximum: 86400 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 30 }
+        expected_status_codes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { type: integer, minimum: 100, maximum: 599 }
+        follow_redirects: { type: boolean }
+        regions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { type: string }
+        paused:
+          type: boolean
+          description: Intenção do usuário. Não confundir com `suspended_reason`.
+        config_version:
+          type: integer
+          description: |
+            Incrementada em **toda** alteração de configuração. O Worker só aplica efeito
+            autoritativo se a versão não mudou desde o claim — é assim que um check em voo
+            não ressuscita uma URL recém-pausada.
+        status: { $ref: '#/components/schemas/MonitorStatus' }
+        unknown_reason: { $ref: '#/components/schemas/UnknownReason' }
+        status_since: { type: string, format: date-time, nullable: true }
+        last_checked_at: { type: string, format: date-time, nullable: true }
+        suspended_reason: { $ref: '#/components/schemas/SuspendedReason' }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+
+    UrlCreate:
+      type: object
+      required: [name, url, check_interval_seconds]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        url:
+          type: string
+          minLength: 8
+          maxLength: 2048
+          description: |
+            Só `http` e `https`. Credenciais na URL, host literal privado e IDN que não
+            vira punycode são recusados com `422 ssrf_blocked`. Esta é a validação
+            **sintática** — a autoritativa é o IP realmente discado, no Worker. As duas
+            rodam os mesmos vetores de `contracts/ssrf-vectors.json`.
+        check_interval_seconds:
+          type: integer
+          minimum: 30
+          maximum: 86400
+          description: Abaixo de `plans.min_interval_seconds` é `422 interval_below_plan_minimum`.
+        timeout_seconds: { type: integer, minimum: 1, maximum: 30, default: 10 }
+        expected_status_codes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          default: [200, 201, 202, 204]
+          items: { type: integer, minimum: 100, maximum: 599 }
+        follow_redirects: { type: boolean, default: true }
+        regions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          default: [sa-east]
+          items: { type: string }
+
+    UrlPatch:
+      type: object
+      minProperties: 1
+      description: Campo ausente não é alterado. Qualquer alteração incrementa `config_version`.
+      properties:
+        name: { type: string, minLength: 1, maxLength: 120 }
+        url: { type: string, minLength: 8, maxLength: 2048 }
+        check_interval_seconds: { type: integer, minimum: 30, maximum: 86400 }
+        timeout_seconds: { type: integer, minimum: 1, maximum: 30 }
+        expected_status_codes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: { type: integer, minimum: 100, maximum: 599 }
+        follow_redirects: { type: boolean }
+        regions:
+          type: array
+          minItems: 1
+          maxItems: 8
+          items: { type: string }
+
+    UrlPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Url' }
+        next_cursor:
+          type: string
+          nullable: true
+          description: '`null` na última página.'
+
+    # ── histórico ───────────────────────────────────────────────────────────
+    History:
+      type: object
+      required: [range, uptime_consolidado, disponibilidade_por_amostra, cobertura, points]
+      properties:
+        range: { type: string, enum: ['24h', '7d', '30d', '90d'] }
+        uptime_consolidado:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Derivado de `incidents`: tempo fora ÷ tempo **medido**. É o número grande da
+            tela. `null` quando não houve janela medida.
+        disponibilidade_por_amostra:
+          type: number
+          format: double
+          nullable: true
+          description: |
+            Do rollup: `up_count / total`. Diagnóstico, não manchete. Com multi-região ele
+            despenca quando uma região fica cega, mesmo com o site no ar — por isso os dois
+            números nunca se misturam.
+        cobertura:
+          type: number
+          format: double
+          description: |
+            Tempo medido ÷ tempo da janela, calculado sobre uma série gerada pelo
+            calendário — não sobre as linhas existentes, senão "o Worker morreu e não
+            gravou nada" apareceria como 100% de cobertura. A janela começa em
+            `urls.created_at` quando o monitor é mais novo que o range pedido.
+        points:
+          type: array
+          items: { $ref: '#/components/schemas/HistoryPoint' }
+
+    HistoryPoint:
+      type: object
+      required: [t, avg_ms, min_ms, max_ms, up, down, unknown]
+      properties:
+        t:
+          type: string
+          format: date-time
+          description: Início do bucket, em UTC.
+        avg_ms: { type: integer, nullable: true }
+        min_ms: { type: integer, nullable: true }
+        max_ms: { type: integer, nullable: true }
+        up: { type: integer }
+        down: { type: integer }
+        unknown:
+          type: integer
+          description: Fora do denominador do uptime. É o que a `cobertura` expõe.
+
+    # ── incidentes ──────────────────────────────────────────────────────────
+    IncidentPage:
+      type: object
+      required: [total, items, next_cursor]
+      properties:
+        total:
+          type: integer
+          description: Total do período `from`–`to`, não da página. O PDF precisa dele para dizer "23 incidentes".
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Incident' }
+        next_cursor: { type: string, nullable: true }
+
+    Incident:
+      type: object
+      required: [id, url_id, started_at, ended_at, duration_seconds, reason, acknowledged_at, flap_group_id]
+      properties:
+        id: { type: integer, format: int64 }
+        url_id: { type: integer, format: int64 }
+        started_at: { type: string, format: date-time }
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: '`null` enquanto aberto. Incidente fechado nunca é reaberto.'
+        duration_seconds: { type: integer, nullable: true }
+        reason: { type: string, nullable: true }
+        acknowledged_at: { type: string, format: date-time, nullable: true }
+        flap_group_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: |
+            Agrupa incidentes **separados** de um mesmo flap. `down → up → down → up` em
+            menos de 120s são dois incidentes com o mesmo grupo, e 9 minutos fora do ar —
+            não 10. Apagar o `ended_at` do primeiro transformaria a recuperação em downtime.
+
+    # ── notificações ────────────────────────────────────────────────────────
+    DeviceRegistration:
+      type: object
+      required: [fcm_token, platform, app_version]
+      properties:
+        fcm_token: { type: string }
+        platform: { type: string, enum: [android] }
+        app_version: { type: integer }
+
+    DeviceRegistered:
+      type: object
+      required: [device_id]
+      properties:
+        device_id: { type: integer, format: int64 }
+
+    NotificationPage:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Notification' }
+        next_cursor: { type: string, nullable: true }
+
+    Notification:
+      type: object
+      required: [id, kind, incident_id, url_id, title, body, read_at, created_at]
+      properties:
+        id: { type: integer, format: int64 }
+        kind:
+          type: string
+          enum:
+            - incident_opened
+            - incident_closed
+            - incident_summary
+            - flap_detected
+            - plan_downgraded
+            - welcome_pro
+            - config_error
+            - removed_from_team
+        incident_id: { type: integer, format: int64, nullable: true }
+        url_id:
+          type: integer
+          format: int64
+          nullable: true
+          description: Destino do deep link `monitor://urls/:id`, quando houver.
+        title: { type: string }
+        body: { type: string }
+        read_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Individual por usuário — um membro marcar como lida não afeta os outros.
+        created_at: { type: string, format: date-time }
+
+    NotificationPrefs:
+      type: object
+      required: [push_enabled, email_enabled, quiet_from, quiet_to, timezone]
+      properties:
+        push_enabled: { type: boolean }
+        email_enabled: { type: boolean }
+        quiet_from: { $ref: '#/components/schemas/QuietTime' }
+        quiet_to: { $ref: '#/components/schemas/QuietTime' }
+        timezone:
+          type: string
+          description: 'Nome IANA, ex.: `America/Sao_Paulo`.'
+
+    NotificationPrefsPatch:
+      type: object
+      minProperties: 1
+      properties:
+        push_enabled: { type: boolean }
+        email_enabled: { type: boolean }
+        quiet_from: { $ref: '#/components/schemas/QuietTime' }
+        quiet_to: { $ref: '#/components/schemas/QuietTime' }
+        timezone: { type: string }
+
+    QuietTime:
+      type: string
+      nullable: true
+      pattern: '^([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]$'
+      description: |
+        Hora local `HH:MM:SS`, sem data. `quiet_from` e `quiet_to` andam juntos: o banco
+        recusa um sem o outro.

@@ -1,0 +1,30 @@
+name: infra-ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23.x'
+          cache-dependency-path: tests/contracts/go.sum
+      - name: Configure test environment
+        run: |
+          cp .env.example .env
+          sed -i 's/migrate_dev/ci_migrate_password/' .env
+          sed -i 's/api_dev/ci_api_password/' .env
+          sed -i 's/worker_dev/ci_worker_password/' .env
+      - name: Run infra gates
+        run: make ci
+      - name: Cleanup
+        if: always()
+        run: PG_VOLUME_NAME=monitor-infra-test-pgdata docker compose -p monitor-infra-test down -v

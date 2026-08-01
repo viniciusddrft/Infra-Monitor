@@ -8,22 +8,52 @@ altera tabela em runtime.
 
 ## Subir o ambiente
 
-Requer Docker (ou Podman com `COMPOSE=podman-compose`).
+Requer Docker (ou Podman com `COMPOSE=podman-compose`) e Go 1.23+.
 
 ```bash
-cp .env.example .env
-make up        # Postgres 16 + alvos locais, espera ficarem saudáveis
-make river     # tabelas do River (exige Go); rode ANTES da 012
-make migrate   # aplica 001 → 012
-make seed      # time, usuário e monitores de desenvolvimento
-make verify    # confere que o schema subiu inteiro
+cp .env.example .env    # e troque as três MONITOR_*_PASSWORD
+make bootstrap          # do zero, e verificado
 ```
 
-Ou tudo de uma vez, do zero: `make reset`.
+`make bootstrap` é `reset` (nuke → up → migrate → seed → verify) mais `test-permissions` e
+`test-login`. Passo a passo, se preferir:
+
+```bash
+make up        # Postgres 16 + alvos locais, espera ficarem saudáveis
+make migrate   # River → migrations 001→012 → senhas dos papéis
+make seed      # time, usuário e monitores de desenvolvimento
+make verify    # PORTÃO: invariante quebrada faz o psql sair 3
+```
+
+**`make migrate` ordena o River sozinho**, e isso é a correção de um defeito real: a 012
+concede privilégios sobre as tabelas que a CLI do River cria, e `GRANT ... ON ALL TABLES`
+sobre um schema vazio é um no-op **legal**. Rodando fora de ordem, a migration "passava" e a
+falha só aparecia no boot do worker, como `permission denied for table river_job`. Hoje a 012
+**recusa** rodar sem as tabelas, e o alvo `migrate` encadeia
+`river → migrate-up → roles-pw`.
 
 `make help` lista os alvos. `make check` roda as consultas de operação — atraso de
 agendamento, lease órfão, resultados zumbi, divergência de estado, compras pendentes de
 acknowledge.
+
+## Os três portões
+
+Nenhum deles é relatório: todos saem diferente de zero quando reprovam.
+
+| Alvo | Prova |
+|---|---|
+| `make verify` | as invariantes do schema, **incluindo os GRANT por coluna** — que a API não escreve `current_status`, que o Worker não escreve `name`, que `teams` só aceita UPDATE por coluna, que o worker consome toda tabela do schema `river`, e que toda partição nasce à meia-noite UTC |
+| `make test-permissions` | os mesmos GRANT, mas **conectando como os papéis reais**: privilégio negado de verdade, a receita de IDs reservados criando o primeiro usuário, `INSERT INTO urls` sem `unknown_reason`, a API enfileirando no River, o trigger recusando o worker limpar `config_error`, e partições criadas sob fusos diferentes com limites idênticos |
+| `make test-login` | que as senhas do `.env` viraram as senhas dos papéis — por TCP a partir de um segundo container na rede Compose, com controle negativo: senha errada **tem** que ser recusada |
+| `make test` | contratos, ciclo completo `up → down → up`, invariantes e permissões em projeto, portas e volume Docker isolados; o ambiente de teste é removido mesmo se houver falha |
+
+Vale ver cada um vermelho uma vez. Portão que nunca reprovou não é portão:
+
+```bash
+docker compose exec -T postgres psql -U monitor -d monitor \
+  -c 'GRANT UPDATE ON teams TO monitor_api'
+make verify    # sai 3, apontando "api NÃO escreve teams.created_at"
+```
 
 ## Alvos locais
 
@@ -67,10 +97,21 @@ resolveria — o dial conhece o IP, nunca o host.
 | 009 | `subscriptions`, `billing_webhook_events`, `billing_tombstones` |
 | 010 | `idempotency_keys`, `rate_events`, `audit_log`, `system_flags`, `worker_blindness` |
 | 011 | papéis, `GRANT` por coluna e o trigger de `suspended_reason` |
-| 012 | privilégios do schema `river` |
+| 012 | privilégios do schema `river` — **recusa rodar antes de `make river`** |
+
+**As migrations são SQL puro, sem meta-comando de psql.** Não é estética: o runner
+`golang-migrate` e o harness de teste da API não executam `\set`, `\if` nem `\gset`. Um
+único meta-comando aqui e a suíte da API não consegue mais
+aplicar o schema. Por isso as senhas dos papéis moram em `db/roles-pw.sql`, fora desta pasta —
+lá o psql é o único consumidor e meta-comando é permitido.
 
 **O `down` existe para desenvolvimento local.** Produção é forward-only: correção lá é uma
 migration nova, para frente. Nunca renomear nem remover coluna em um passo.
+
+`make migrate` é incremental e reexecutável pelo `golang-migrate`: a tabela
+`schema_migrations` registra a versão e o estado `dirty`. `make version` consulta esse
+estado; `make migrate-force VERSION=N` é recuperação manual, não fluxo normal. O caminho
+suportado para reconstruir o ambiente local continua sendo `make reset`.
 
 ## Três coisas que o schema garante e que é fácil errar
 
@@ -102,14 +143,48 @@ make diff-contracts   # acusa divergência
 - `ssrf-vectors.json` — 47 vetores de IP e 18 sintáticos. A API valida sintaticamente na
   criação da URL; o Worker valida o IP realmente discado no `Dialer.Control`. As duas rodam
   **estes** casos, senão divergem.
-- `openapi.yaml` — ainda não escrito. É contract-first: o CI da API valida as respostas contra
-  ele e o CI do app gera os modelos a partir dele. É o próximo artefato da fase 0.
+- `openapi.yaml` — contrato da fase 1, escrito à mão e **antes** do código. O CI da API valida
+  cada resposta da suíte contra ele (`kin-openapi`), e o CI do app gera os modelos Dart a
+  partir dele. Cobre auth, `/v1/me`, dashboard, o CRUD de URLs, histórico, incidentes,
+  devices, inbox e preferências. Times, billing e exclusão de conta entram por PR nas fases 5
+  e 6.
+
+  Ele **não** é copiado para os repos irmãos pelo `sync-contracts`, ao contrário dos vetores
+  de SSRF: a suíte da API o lê deste diretório (`MONITOR_INFRA_DIR`) e o app gera a partir
+  daqui. Uma cópia seria mais uma superfície para divergir.
+
+  Duas armadilhas já pagas, para quem for editar:
+
+  - **não** adicione um bloco `servers`, nem `- url: /`. O router do `kin-openapi` consome o
+    prefixo do servidor antes de casar o caminho, e a suíte inteira passa a falhar com "rota
+    ausente no OpenAPI";
+  - toda operação declara `default` com o envelope de erro. Sem isso o validador **aceita em
+    silêncio** qualquer status não documentado — um 500 com corpo em texto passaria por
+    resposta válida.
 
 ## Pendências
 
-- O runner de migration ainda não foi escolhido. Hoje o `Makefile` aplica via `psql` em ordem.
-  A escolha entre `golang-migrate`, `goose` e `dbmate` depende de um requisito concreto:
-  `CREATE INDEX CONCURRENTLY` não roda dentro de transação, então o runner precisa permitir
-  migration sem transação.
+- **`monitor_migrate` é decorativo hoje, e isso tem prazo.** Ele é criado, recebe senha e fuso,
+  e não recebe privilégio nenhum: quem aplica as migrations é o superusuário de
+  `DATABASE_URL_MIGRATE`. Em produção isso significa migrar com uma credencial capaz de
+  qualquer coisa no cluster.
+
+  **Gatilho: logo após o primeiro `make bootstrap` verde.** A separação foi adiada de
+  propósito, e não por esquecimento — fazer redesenho de privilégio na mesma rodada da
+  primeira execução de um schema que nunca rodou confunde duas fontes de falha: quebrando,
+  não se sabe se foi o schema ou a troca de papel. O `make test-login` já cobre o
+  `monitor_migrate`, então a credencial dele estará provada quando a hora chegar.
+
+  O desenho já levantado, para quando for feito: `001` cria `pg_stat_statements`, que **não**
+  é extensão *trusted* e exige superusuário, e `011` faz `CREATE ROLE`, que exige superusuário
+  ou `CREATEROLE`. As demais rodam como `monitor_migrate` se ele tiver `CREATE` no schema
+  `public`. Então: bootstrap superusuário mínimo (extensões + papéis), resto sob
+  `monitor_migrate`, e `DATABASE_URL_MIGRATE` repontuada. Ganho colateral relevante — as
+  funções `SECURITY DEFINER` da `004` hoje pertencem ao superusuário, o que dá ao Worker DDL
+  de superusuário através delas; passando a ser de `monitor_migrate`, o privilégio efetivo cai
+  para o necessário.
+- `RIVER_VERSION` está pinado no `Makefile`. Subir é decisão consciente: a 012 concede
+  privilégio tabela a tabela, e um upgrade que cria tabela nova depende do
+  `ALTER DEFAULT PRIVILEGES` que ela instala.
 - Os documentos de decisão ainda estão em `../docs/` e `../db/PLANO.md`. O lugar deles é aqui.
 - Backup, PITR e o drill de restore: `docs/runbooks/db-restore.md` está por escrever.

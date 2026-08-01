@@ -3,14 +3,28 @@
 -- Aqui a tabela de propriedade deixa de ser convenção. Se a API tentar
 -- UPDATE urls SET current_status, o banco recusa.
 --
--- As senhas vêm do ambiente; o Makefile as passa. Em produção, do gestor de
--- segredos — nunca deste arquivo.
-
-\set migrate_pw `echo "${MONITOR_MIGRATE_PASSWORD:-migrate_dev}"`
-\set api_pw     `echo "${MONITOR_API_PASSWORD:-api_dev}"`
-\set worker_pw  `echo "${MONITOR_WORKER_PASSWORD:-worker_dev}"`
+-- As senhas NÃO moram aqui: os papéis nascem sem senha e quem as define é
+-- `db/roles-pw.sql`, via `make roles-pw`. Duas razões, ambas mordendo:
+--
+--   1. a versão anterior usava `\set api_pw \`echo "${MONITOR_API_PASSWORD:-api_dev}"\``.
+--      A crase roda um shell no processo CLIENTE do psql — que aqui vive DENTRO
+--      do container do Postgres, onde MONITOR_API_PASSWORD não existe. O
+--      fallback `:-api_dev` vencia sempre e o \set ainda sobrescrevia o valor
+--      passado por -v. Papel de produção nasceria com senha de desenvolvimento,
+--      em silêncio;
+--   2. meta-comando de psql (\set, \if, \gset) não roda no golang-migrate, e o
+--      harness de teste da API usa o mesmo runner. Com meta-comando aqui, a
+--      suíte da API não consegue aplicar o schema.
+--
+-- Este arquivo é SQL puro de propósito. Mantenha assim.
 
 DO $$ BEGIN
+    -- RESERVADO, ainda sem privilégio: quem aplica as migrations hoje é o
+    -- superusuário de DATABASE_URL_MIGRATE. A separação (bootstrap superusuário
+    -- mínimo + resto sob monitor_migrate) está agendada para logo depois do
+    -- primeiro `make bootstrap` verde — ver a seção Pendências do README. Não é
+    -- esquecimento: é adiamento com gatilho, para não misturar redesenho de
+    -- privilégio com a primeira execução do schema.
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'monitor_migrate') THEN
         CREATE ROLE monitor_migrate LOGIN;
     END IF;
@@ -22,9 +36,9 @@ DO $$ BEGIN
     END IF;
 END $$;
 
-ALTER ROLE monitor_migrate PASSWORD :'migrate_pw';
-ALTER ROLE monitor_api     PASSWORD :'api_pw';
-ALTER ROLE monitor_worker  PASSWORD :'worker_pw';
+-- Sem senha aqui. Papel sem senha não loga por TCP (o pg_hba do container exige
+-- scram para conexão de rede), então o estado intermediário é seguro: falha
+-- fechado, não aberto. `make roles-pw` fecha o ciclo.
 
 -- `SET timezone` numa migration configura só aquela conexão. ALTER ROLE vale
 -- para TODA sessão futura do papel, inclusive as do pool.
@@ -92,7 +106,14 @@ GRANT INSERT ON notifications TO monitor_worker;
 GRANT UPDATE (read_at) ON notifications TO monitor_api;
 
 GRANT INSERT, UPDATE, DELETE ON refresh_tokens, devices, notification_prefs, invites,
-      idempotency_keys, rate_events, users, teams TO monitor_api;
+      idempotency_keys, rate_events, users TO monitor_api;
+
+-- `teams` fica FORA do UPDATE de tabela inteira acima. UPDATE amplo é
+-- superconjunto do `GRANT UPDATE (name, dashboard_version, updated_at) ON teams`
+-- lá em cima e o tornava decorativo: a API
+-- podia escrever qualquer coluna de teams, inclusive owner_user_id. `urls` só
+-- não sofria do mesmo por não estar nesta lista — sorte, não regra.
+GRANT INSERT, DELETE ON teams TO monitor_api;
 GRANT INSERT, UPDATE ON billing_webhook_events TO monitor_api;
 GRANT UPDATE          ON billing_webhook_events TO monitor_worker;
 GRANT INSERT, UPDATE  ON subscriptions TO monitor_api, monitor_worker;
@@ -101,6 +122,25 @@ GRANT INSERT, UPDATE, DELETE ON devices TO monitor_worker;  -- apaga token morto
 GRANT INSERT          ON audit_log TO monitor_api, monitor_worker;
 GRANT INSERT, UPDATE  ON system_flags TO monitor_worker;
 GRANT INSERT, UPDATE  ON worker_blindness TO monitor_worker;
+
+-- Fonte canônica do check de boot. É criada pelo golang-migrate antes da 001.
+-- Serviços só leem; nenhum processo de runtime pode promover artificialmente
+-- a versão do banco nem limpar o estado dirty.
+GRANT SELECT ON schema_migrations TO monitor_api, monitor_worker;
+
+-- ── caminho frio: estes jobs rodam no WORKER via River, não na API ───────────
+-- Sem estes DELETE, `purge_url_history` e `cleanup` morreriam com permission
+-- denied na primeira execução — e são jobs periódicos, então a falha apareceria
+-- como fila crescendo, não como erro na cara de alguém.
+--
+-- purge_url_history: url_history não tem FK para urls, então apagar a URL deixa
+-- histórico órfão, e quem varre é o worker.
+GRANT DELETE ON url_history TO monitor_worker;
+-- cleanup (1h) e stale_devices (1d): chave de idempotência vencida, janela de
+-- rate limit passada, convite expirado, refresh token revogado.
+GRANT DELETE ON idempotency_keys, rate_events, invites, refresh_tokens TO monitor_worker;
+-- Só DELETE: o worker apaga o que expirou e nunca cria nada nestas tabelas.
+-- Quem escreve continua sendo a API.
 
 -- Os serviços conectam DIRETAMENTE como estes papéis — sem login genérico com
 -- SET ROLE, sem herança por membership. O trigger acima compara current_user, e

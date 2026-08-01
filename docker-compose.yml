@@ -3,7 +3,6 @@ name: monitor
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: monitor-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-monitor}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-monitor_dev}
@@ -36,17 +35,18 @@ services:
   # Alvos locais para o worker checar. Ver targets/nginx.conf.
   alvo-local:
     image: nginx:alpine
-    container_name: monitor-alvo-local
     ports:
       - "${TARGET_PORT:-8081}:80"
     volumes:
       - ./targets/nginx.conf:/etc/nginx/conf.d/default.conf:ro
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost/ok || exit 1"]
+      # Evita localhost → ::1: este server escuta IPv4 e algumas versões do
+      # BusyBox/wget não fazem fallback para 127.0.0.1.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/ok || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
 
 volumes:
   pgdata:
-    name: monitor-pgdata
+    name: ${PG_VOLUME_NAME:-monitor-pgdata}
